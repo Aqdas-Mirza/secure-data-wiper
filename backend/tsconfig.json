@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    /* File Layout */
+    "rootDir": "./src",         // where your TS code lives
+    "outDir": "./dist",         // compiled JS output
+
+    /* Environment Settings */
+    "module": "nodenext",       // Node ESM with extension-aware resolution
+    "moduleResolution": "nodenext", // resolve like Node ESM (supports .ts in TS)
+    "target": "es2019",         // safe JS target for Node 16/18
+    "lib": ["esnext"],          // use latest JS features
+    "types": ["node"],          // get Node.js type definitions
+
+    /* Output Settings */
+    "sourceMap": true,          // allow debugging
+    "declaration": true,        // generate .d.ts files
+    "declarationMap": true,     // map declarations back to source
+
+    /* Strictness */
+    "strict": true,             // enable all strict checks
+    "esModuleInterop": true,    // allows default imports of CJS modules
+    "resolveJsonModule": true,  // allow import of JSON files
+    "skipLibCheck": true,       // skip library type checks for speed
+
+    /* Style */
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src"],           // compile only files in src/
+  "exclude": ["node_modules", "dist"] // ignore these
+}
