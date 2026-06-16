@@ -156,7 +156,9 @@ const SystemScan: React.FC<SystemScanProps> = ({ isScanning, onStartScan }) => {
 
         {/* Footer */}
         <div className="text-center mt-8 text-sm text-gray-500">
-          <p>Version 1.0.0 | Windows Prototype | NIST SP 800-88 Rev. 1 Compliant</p>
+          <p>
+            Version 1.0.0 | Windows Prototype | NIST SP 800-88 Rev. 1 Compliant — Made with love by Aqdas Mirza ❤️
+          </p>
         </div>
       </div>
     </div>
