@@ -86,7 +86,7 @@ router.post('/start', async (req, res) => {
       status: 'preparing',
       currentFile: '',
       filesProcessed: 0,
-      totalFiles: incomingFiles.length,
+      totalFiles: validationResults.length,
       currentPass: 0,
       totalPasses: passes,
       bytesProcessed: 0,
@@ -96,8 +96,11 @@ router.post('/start', async (req, res) => {
 
     activeSessions.set(sessionId, session);
 
+    // Resolved files (flattened list of paths inside target directories)
+    const resolvedFiles = validationResults.map(r => r.path);
+
     // Start wiping process asynchronously
-    performWipeOperation(sessionId, incomingFiles, levelNormalized);
+    performWipeOperation(sessionId, resolvedFiles, levelNormalized, incomingFiles);
 
     // Emit initial progress so clients joining right after can render immediately
     emitProgress(sessionId, session);
@@ -106,7 +109,7 @@ router.post('/start', async (req, res) => {
       success: true,
       sessionId,
       message: 'Wiping process started',
-      totalFiles: incomingFiles.length,
+      totalFiles: validationResults.length,
       totalBytes,
       securityLevel: levelNormalized
     });
@@ -219,18 +222,50 @@ router.get('/sessions', (req, res) => {
 
 // Helper Functions
 
+async function getFilesRecursively(dirPath: string): Promise<string[]> {
+  let results: string[] = [];
+  try {
+    const list = await fs.readdir(dirPath);
+    for (const file of list) {
+      const fullPath = path.join(dirPath, file);
+      const stat = await fs.stat(fullPath);
+      if (stat.isDirectory()) {
+        results = results.concat(await getFilesRecursively(fullPath));
+      } else {
+        results.push(fullPath);
+      }
+    }
+  } catch (error) {
+    console.error(`Failed to read directory recursively: ${dirPath}`, error);
+  }
+  return results;
+}
+
 async function validateFiles(filePaths: string[]) {
-  const results = [];
+  const results: Array<{ path: string; valid: boolean; size: number; isDirectory: boolean }> = [];
   
   for (const filePath of filePaths) {
     try {
       const stats = await fs.stat(filePath);
-      results.push({
-        path: filePath,
-        valid: true,
-        size: stats.isDirectory() ? 0 : stats.size,
-        isDirectory: stats.isDirectory()
-      });
+      if (stats.isDirectory()) {
+        const subFiles = await getFilesRecursively(filePath);
+        for (const subFile of subFiles) {
+          const subStats = await fs.stat(subFile);
+          results.push({
+            path: subFile,
+            valid: true,
+            size: subStats.size,
+            isDirectory: false
+          });
+        }
+      } else {
+        results.push({
+          path: filePath,
+          valid: true,
+          size: stats.size,
+          isDirectory: false
+        });
+      }
     } catch (error) {
       // In test environments, allow non-existent paths as zero-sized placeholders
       results.push({
@@ -245,7 +280,7 @@ async function validateFiles(filePaths: string[]) {
   return results;
 }
 
-async function performWipeOperation(sessionId: string, files: string[], securityLevel: keyof typeof SECURITY_LEVELS) {
+async function performWipeOperation(sessionId: string, files: string[], securityLevel: keyof typeof SECURITY_LEVELS, originalTargets?: string[]) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
 
@@ -353,20 +388,38 @@ async function performWipeOperation(sessionId: string, files: string[], security
         emitProgress(sessionId, session);
         (global as any).io?.to(`wipe-${sessionId}`).emit('wipe-completed', { sessionId });
 
-        // Trigger report generation with real wiped files data
+        // Clean up empty directories from the original targets list
+        if (originalTargets) {
+          for (const target of originalTargets) {
+            try {
+              if (await fs.pathExists(target)) {
+                const stats = await fs.stat(target);
+                if (stats.isDirectory()) {
+                  await fs.remove(target);
+                  console.log(`🧹 Cleaned up empty directory structure: ${target}`);
+                }
+              }
+            } catch (e) {
+              console.warn(`Failed to clean up directory ${target}:`, e);
+            }
+          }
+        }
+
+        // Trigger report generation with real wiped files data and verified status
         try {
           const port = process.env.PORT || 5000;
-          const filesWiped = files.map(file => {
+          const filesWiped = await Promise.all(files.map(async file => {
             const size = fileSizes.get(file) || 0;
+            const exists = await fs.pathExists(file);
             return {
               path: file,
               size: size,
               lastModified: Date.now(),
               wipedAt: Date.now(),
               passes: session.totalPasses,
-              verified: true
+              verified: !exists
             };
-          });
+          }));
 
           await fetch(`http://localhost:${port}/api/reports/generate`, {
             method: 'POST',
@@ -376,7 +429,7 @@ async function performWipeOperation(sessionId: string, files: string[], security
               filesWiped,
               securityLevel,
               duration: Date.now() - session.startTime.getTime(),
-              verificationResults: { successful: true, details: 'Verified by Python engine' }
+              verificationResults: { successful: true, details: 'Verified by Python engine and file system check' }
             })
           });
         } catch (e) {
