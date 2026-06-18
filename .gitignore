@@ -29,3 +29,5 @@ yarn-debug.log*
 coverage/
 .cache/
 .DS_Store
+
+analysis_results.md

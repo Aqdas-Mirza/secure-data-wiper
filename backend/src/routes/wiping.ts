@@ -31,6 +31,8 @@ interface WipeProgress {
 
 // In-memory session storage (consider Redis for production)
 const activeSessions = new Map<string, WipeProgress>();
+// Track active Python child processes for cancellations
+const activeProcesses = new Map<string, any>();
 
 // Security level configurations
 const SECURITY_LEVELS = {
@@ -181,6 +183,13 @@ router.post('/cancel/:sessionId', (req, res) => {
   session.status = 'error';
   session.error = 'Cancelled by user';
 
+  // Kill Python process if active
+  const pythonProcess = activeProcesses.get(sessionId);
+  if (pythonProcess) {
+    pythonProcess.kill();
+    activeProcesses.delete(sessionId);
+  }
+
   // Emit cancellation to frontend
   (global as any).io?.to(`wipe-${sessionId}`).emit('wipe-cancelled', { sessionId });
 
@@ -244,61 +253,145 @@ async function performWipeOperation(sessionId: string, files: string[], security
     session.status = 'wiping';
     emitProgress(sessionId, session);
 
-    const config = SECURITY_LEVELS[securityLevel];
-    
-    for (let i = 0; i < files.length; i++) {
-      const filePath = files[i];
-      session.currentFile = filePath;
-      
-      // Check if session was cancelled (re-read to avoid TS literal narrowing)
-      const current = activeSessions.get(sessionId);
-      if (current && current.status === 'error') {
-        return;
-      }
-
+    // Get file size mapping for progress calculations
+    const fileSizes = new Map<string, number>();
+    for (const file of files) {
       try {
-        await wipeFile(filePath, config.patterns, sessionId);
-        session.filesProcessed++;
-        emitProgress(sessionId, session);
-      } catch (error) {
-        console.error(`❌ Failed to wipe file ${filePath}:`, error);
-        session.status = 'error';
-        session.error = `Failed to wipe ${filePath}: ${error instanceof Error ? error.message : 'Unknown error'}`;
-        emitProgress(sessionId, session);
-        return;
+        const stats = await fs.stat(file);
+        fileSizes.set(file, stats.isDirectory() ? 0 : stats.size);
+      } catch {
+        fileSizes.set(file, 0);
       }
     }
 
-    // Verification phase
-    session.status = 'verifying';
-    session.currentFile = 'Performing verification...';
-    emitProgress(sessionId, session);
+    const scriptPath = path.join(process.cwd(), 'wiping-engine', 'secure_wiper.py');
+    const pythonArgs = ['-u', scriptPath, '--files', ...files, '--security-level', securityLevel, '--mode', 'files'];
 
-    await performVerification(sessionId, files);
+    console.log(`🚀 Spawning Python wiper engine for session ${sessionId}`);
+    console.log(`Command: python ${pythonArgs.join(' ')}`);
 
-    // Completion
-    session.status = 'completed';
-    session.currentFile = 'All files wiped successfully';
-    emitProgress(sessionId, session);
-    // Notify completion explicitly (frontend listens for 'wipe-completed')
-    (global as any).io?.to(`wipe-${sessionId}`).emit('wipe-completed', { sessionId });
+    const pythonProcess = spawn('python', pythonArgs);
+    activeProcesses.set(sessionId, pythonProcess);
 
-    // Auto-generate a report on completion to ensure Reports view has data
-    try {
-      const port = process.env.PORT || 5000;
-      await fetch(`http://localhost:${port}/api/reports/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId })
-      });
-    } catch (e) {
-      console.warn('Report auto-generation failed:', e);
-    }
+    let stdoutData = '';
 
-    console.log(`✅ Wiping session ${sessionId} completed successfully`);
+    pythonProcess.stdout.on('data', (data) => {
+      stdoutData += data.toString();
+      const lines = stdoutData.split('\n');
+      stdoutData = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith('PROGRESS:')) {
+          try {
+            const rawProgress = JSON.parse(trimmed.substring(9));
+            if (rawProgress.status === 'starting') {
+              // Starting progress
+            } else if (rawProgress.status === 'wiping') {
+              session.currentFile = rawProgress.current_file;
+              session.filesProcessed = rawProgress.file_index - 1;
+            } else if (rawProgress.status === 'verifying') {
+              session.status = 'verifying';
+              session.currentFile = 'Performing verification...';
+            } else if (rawProgress.status === 'completed') {
+              // Completed progress
+            } else if (rawProgress.current_pass !== undefined) {
+              session.currentPass = rawProgress.current_pass;
+              session.totalPasses = rawProgress.total_passes;
+              if (rawProgress.current_file) {
+                session.currentFile = rawProgress.current_file;
+              }
+            } else if (rawProgress.file_progress !== undefined) {
+              const currentFile = session.currentFile;
+              const currentFileSize = fileSizes.get(currentFile) || 0;
+              const currentPass = session.currentPass;
+              const position = rawProgress.bytes_processed || 0;
+
+              let completedBytes = 0;
+              for (let i = 0; i < session.filesProcessed; i++) {
+                const f = files[i];
+                const fSize = fileSizes.get(f) || 0;
+                completedBytes += fSize * session.totalPasses;
+              }
+              completedBytes += (currentPass - 1) * currentFileSize;
+              completedBytes += position;
+
+              session.bytesProcessed = completedBytes;
+            }
+            emitProgress(sessionId, session);
+          } catch (e) {
+            console.warn('Failed to parse progress line:', trimmed, e);
+          }
+        } else if (trimmed.startsWith('ERROR:')) {
+          const errorMsg = trimmed.substring(6);
+          console.error(`❌ Python engine error: ${errorMsg}`);
+          session.error = errorMsg;
+        } else if (trimmed.startsWith('RESULT:')) {
+          console.log(`📊 Python engine final result: ${trimmed.substring(7)}`);
+        }
+      }
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      console.error(`Python stderr: ${data.toString()}`);
+    });
+
+    pythonProcess.on('close', async (code, signal) => {
+      console.log(`Python process closed with code ${code} and signal ${signal}`);
+      activeProcesses.delete(sessionId);
+
+      if (session.status === 'error') {
+        emitProgress(sessionId, session);
+        return;
+      }
+
+      if (code === 0) {
+        session.status = 'completed';
+        session.currentFile = 'All files wiped successfully';
+        emitProgress(sessionId, session);
+        (global as any).io?.to(`wipe-${sessionId}`).emit('wipe-completed', { sessionId });
+
+        // Trigger report generation with real wiped files data
+        try {
+          const port = process.env.PORT || 5000;
+          const filesWiped = files.map(file => {
+            const size = fileSizes.get(file) || 0;
+            return {
+              path: file,
+              size: size,
+              lastModified: Date.now(),
+              wipedAt: Date.now(),
+              passes: session.totalPasses,
+              verified: true
+            };
+          });
+
+          await fetch(`http://localhost:${port}/api/reports/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sessionId,
+              filesWiped,
+              securityLevel,
+              duration: Date.now() - session.startTime.getTime(),
+              verificationResults: { successful: true, details: 'Verified by Python engine' }
+            })
+          });
+        } catch (e) {
+          console.warn('Report auto-generation failed:', e);
+        }
+      } else {
+        session.status = 'error';
+        session.error = session.error || `Python engine exited with code ${code}`;
+        emitProgress(sessionId, session);
+        (global as any).io?.to(`wipe-${sessionId}`).emit('wipe-error', { sessionId, error: session.error });
+      }
+    });
 
   } catch (error) {
-    console.error(`❌ Wiping session ${sessionId} failed:`, error);
+    console.error(`❌ Wiping session ${sessionId} failed to spawn:`, error);
     session.status = 'error';
     session.error = error instanceof Error ? error.message : 'Unknown error';
     emitProgress(sessionId, session);
@@ -306,102 +399,10 @@ async function performWipeOperation(sessionId: string, files: string[], security
   }
 }
 
-async function wipeFile(filePath: string, patterns: number[], sessionId: string) {
-  const session = activeSessions.get(sessionId);
-  if (!session) throw new Error('Session not found');
-
-  // If file does not exist or is a directory, skip actual wiping to keep session flowing
-  try {
-    const stats = await fs.stat(filePath);
-    if (stats.isDirectory()) {
-      return;
-    }
-  } catch {
-    return;
-  }
-
-  const fileSize = (await fs.stat(filePath)).size;
-  const fd = await fs.open(filePath, 'r+');
-
-  try {
-    for (let pass = 0; pass < patterns.length; pass++) {
-      session.currentPass = pass + 1;
-      
-      // Check for cancellation
-      if (session.status === 'error') {
-        throw new Error('Operation cancelled');
-      }
-
-      const pattern = Buffer.alloc(4096, patterns[pass]);
-      let position = 0;
-
-      while (position < fileSize) {
-        const bytesToWrite = Math.min(4096, fileSize - position);
-        const chunk = pattern.subarray(0, bytesToWrite);
-        
-        await fs.write(fd, chunk, 0, bytesToWrite, position);
-        position += bytesToWrite;
-        session.bytesProcessed += bytesToWrite;
-
-        // Emit progress periodically
-        if (position % (1024 * 1024) === 0 || position >= fileSize) {
-          emitProgress(sessionId, session);
-        }
-      }
-
-      // Force write to disk
-      await fs.fsync(fd);
-    }
-
-    // Final random pass for maximum security
-    if (patterns.length >= 7) {
-      session.currentPass = patterns.length + 1;
-      const randomBuffer = crypto.randomBytes(Math.min(4096, fileSize));
-      let position = 0;
-
-      while (position < fileSize) {
-        const bytesToWrite = Math.min(randomBuffer.length, fileSize - position);
-        await fs.write(fd, randomBuffer, 0, bytesToWrite, position);
-        position += bytesToWrite;
-        session.bytesProcessed += bytesToWrite;
-      }
-      
-      await fs.fsync(fd);
-    }
-
-  } finally {
-    await fs.close(fd);
-    
-    // Delete the file after wiping
-    await fs.unlink(filePath);
-  }
-}
-
-async function performVerification(sessionId: string, originalFiles: string[]) {
-  const session = activeSessions.get(sessionId);
-  if (!session) return;
-
-  // Simple verification: check that files no longer exist
-  const stillExist = [];
-  
-  for (const filePath of originalFiles) {
-    if (await fs.pathExists(filePath)) {
-      stillExist.push(filePath);
-    }
-  }
-
-  if (stillExist.length > 0) {
-    throw new Error(`Verification failed: ${stillExist.length} files still exist`);
-  }
-
-  console.log(`✅ Verification completed for session ${sessionId}`);
-}
-
 function emitProgress(sessionId: string, session: WipeProgress) {
-  // Calculate ETA
   if (session.bytesProcessed > 0 && session.status === 'wiping') {
     const elapsed = Date.now() - session.startTime.getTime();
-    const rate = session.bytesProcessed / elapsed; // bytes per ms
+    const rate = session.bytesProcessed / elapsed;
     const remaining = session.totalBytes - session.bytesProcessed;
     session.estimatedCompletion = new Date(Date.now() + (remaining / rate));
   }
