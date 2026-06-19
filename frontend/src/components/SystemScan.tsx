@@ -40,7 +40,7 @@ const SystemScan: React.FC<SystemScanProps> = ({ isScanning, onStartScan }) => {
 
               {/* Features */}
               <div className="grid md:grid-cols-3 gap-6 mb-8">
-                <div className="text-center p-4 border rounded-lg">
+                <div className="text-center p-4 border border-gray-200 rounded-lg transform transition-all duration-300 hover:scale-105 hover:shadow-xl hover:border-green-300 hover:-translate-y-1 cursor-pointer">
                   <div className="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-3">
                     <Search className="w-6 h-6 text-green-600" />
                   </div>
@@ -50,7 +50,7 @@ const SystemScan: React.FC<SystemScanProps> = ({ isScanning, onStartScan }) => {
                   </p>
                 </div>
                 
-                <div className="text-center p-4 border rounded-lg">
+                <div className="text-center p-4 border border-gray-200 rounded-lg transform transition-all duration-300 hover:scale-105 hover:shadow-xl hover:border-blue-300 hover:-translate-y-1 cursor-pointer">
                   <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-3">
                     <Monitor className="w-6 h-6 text-blue-600" />
                   </div>
@@ -60,7 +60,7 @@ const SystemScan: React.FC<SystemScanProps> = ({ isScanning, onStartScan }) => {
                   </p>
                 </div>
                 
-                <div className="text-center p-4 border rounded-lg">
+                <div className="text-center p-4 border border-gray-200 rounded-lg transform transition-all duration-300 hover:scale-105 hover:shadow-xl hover:border-purple-300 hover:-translate-y-1 cursor-pointer">
                   <div className="w-12 h-12 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-3">
                     <AlertCircle className="w-6 h-6 text-purple-600" />
                   </div>
